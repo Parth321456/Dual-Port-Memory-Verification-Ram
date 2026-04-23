@@ -1,0 +1,272 @@
+interface dpmv_if #(parameter DATA_WIDTH=8, ADDR_WIDTH=4);
+
+    logic clk;
+
+    logic we_a;
+    logic [ADDR_WIDTH-1:0] addr_a;
+    logic [DATA_WIDTH-1:0] din_a;
+    logic [DATA_WIDTH-1:0] dout_a;
+
+    logic we_b;
+    logic [ADDR_WIDTH-1:0] addr_b;
+    logic [DATA_WIDTH-1:0] din_b;
+    logic [DATA_WIDTH-1:0] dout_b;
+
+    endinterface
+
+class transaction;
+    rand bit port;
+    rand bit [3:0] addr;
+    rand bit [7:0] data;
+    bit read;
+    endclass
+
+class generator;
+
+    mailbox gen2drv;
+
+    function new(mailbox gen2drv);
+        this.gen2drv = gen2drv;
+    endfunction
+
+    task run();
+        transaction t;
+
+        repeat (10) begin
+            t = new();
+            assert(t.randomize());
+            t.read = 0;
+
+        $display("GEN: Addr=%0d Data=%h Port=%0d",
+        t.addr, t.data, t.port);
+
+        gen2drv.put(t);
+        end
+        endtask
+
+        endclass
+
+class driver;
+
+    virtual dpmv_if intf;
+    mailbox gen2drv;
+
+    function new(virtual dpmv_if intf, mailbox gen2drv);
+        this.intf = intf;
+        this.gen2drv = gen2drv;
+    endfunction
+
+    task run();
+        transaction t;
+
+        forever begin
+            gen2drv.get(t);
+
+            @(posedge intf.clk);
+            #1;
+
+            $display("DRIVER: Writing Addr=%0d Data=%h Port=%0d",
+                      t.addr, t.data, t.port);
+
+            if (t.port == 0) begin
+                intf.we_a = 1;
+                intf.addr_a = t.addr;
+                intf.din_a = t.data;
+            end else begin
+                intf.we_b = 1;
+                intf.addr_b = t.addr;
+                intf.din_b = t.data;
+            end
+
+          
+            @(posedge intf.clk);
+            @(posedge intf.clk);
+            #1;
+            intf.we_a = 0;
+            intf.we_b = 0;
+        end
+    endtask
+
+endclass
+
+class monitor;
+
+    virtual dpmv_if intf;
+    mailbox mon2scb;
+
+    bit last_we_a, last_we_b;
+
+    function new(virtual dpmv_if intf, mailbox mon2scb);
+        this.intf = intf;
+        this.mon2scb = mon2scb;
+    endfunction
+
+    task run();
+        transaction t;
+
+        forever begin
+            @(posedge intf.clk);
+            #1;
+
+            if (intf.we_a == 1) begin
+                t = new();
+                t.addr = intf.addr_a;
+                t.data = intf.din_a;
+                t.port = 0;
+                t.read = 0;
+
+                mon2scb.put(t);
+            end
+          
+            if (intf.we_b == 1) begin
+                t = new();
+                t.addr = intf.addr_b;
+                t.data = intf.din_b;
+                t.port = 1;
+                t.read = 0;
+
+                mon2scb.put(t);
+            end
+
+         
+            if (last_we_a == 1 && intf.we_a == 0) begin
+                @(posedge intf.clk);
+
+                t = new();
+                t.addr = intf.addr_a;
+                t.data = intf.dout_a;
+                t.port = 0;
+                t.read = 1;
+
+                mon2scb.put(t);
+            end
+            if (last_we_b == 1 && intf.we_b == 0) begin
+                @(posedge intf.clk);
+
+                t = new();
+                t.addr = intf.addr_b;
+                t.data = intf.dout_b;
+                t.port = 1;
+                t.read = 1;
+
+                mon2scb.put(t);
+            end
+
+            last_we_a = intf.we_a;
+            last_we_b = intf.we_b;
+            end
+            endtask
+            endclass
+
+class scoreboard;
+
+    mailbox mon2scb;
+    bit [7:0] ref_mem [0:15];
+
+    function new(mailbox mon2scb);
+    this.mon2scb = mon2scb;
+
+    foreach(ref_mem[i])
+            ref_mem[i] = 0;
+    endfunction
+
+    task run();
+        transaction t;
+
+        forever begin
+            mon2scb.get(t);
+
+            
+        if (t.read == 0) begin
+       ref_mem[t.addr] = t.data;
+
+       $display("WRITE OK: Addr=%0d Data=%h",
+       t.addr, t.data);
+       end
+
+           
+       else begin
+        if (ref_mem[t.addr] == t.data) begin
+         $display("PASS: READ Addr=%0d Expected=%h Got=%h Time=%0t",
+                              t.addr, ref_mem[t.addr], t.data, $time);
+         end else begin
+           
+         $display("FAIL: READ Addr=%0d Expected=%h Got=%h Time=%0t",
+         t.addr, ref_mem[t.addr], t.data, $time);
+                
+         end
+         end
+         end
+         endtask  
+
+         endclass
+
+class environment;
+
+    generator gen;
+    driver drv;
+    monitor mon;
+    scoreboard scb;
+
+    mailbox gen2drv;
+    mailbox mon2scb;
+
+    function new(virtual dpmv_if intf);
+
+        gen2drv = new();
+        mon2scb = new();
+
+        gen = new(gen2drv);
+        drv = new(intf, gen2drv);
+        mon = new(intf, mon2scb);
+        scb = new(mon2scb);
+
+    endfunction
+
+    task run();
+        fork
+          gen.run();
+          drv.run();
+          mon.run();
+          scb.run();
+        join_none
+        endtask
+
+        endclass
+
+module tb_top;
+
+    dpmv_if intf();
+
+    dpmv DUT (
+        .clk(intf.clk),
+        .we_a(intf.we_a),
+        .addr_a(intf.addr_a),
+        .din_a(intf.din_a),
+        .dout_a(intf.dout_a),
+        .we_b(intf.we_b),
+        .addr_b(intf.addr_b),
+        .din_b(intf.din_b),
+        .dout_b(intf.dout_b)
+    );
+
+    environment env;
+
+    initial intf.clk = 0;
+    always #5 intf.clk = ~intf.clk;
+
+    initial begin
+        $dumpfile("dump.vcd");
+        $dumpvars(0, tb_top);
+    end
+
+    initial begin
+        intf.we_a = 0;
+        intf.we_b = 0;
+
+        env = new(intf);
+        env.run();
+
+        #1000;
+        $finish;
+    end
